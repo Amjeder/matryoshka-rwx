@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import heapq
 import json
@@ -108,6 +109,17 @@ def scope_for(file_evidence: dict, edit: Edit) -> list | None:
     return None
 
 
+def tests_in_affected_suites(file: dict, edits: list[Edit], test_ids: list[str]) -> set[int]:
+    scopes = [scope_for(file, edit) for edit in edits]
+    if not all(scopes):
+        return set()
+    readers = {index for scope in scopes for index in scope}
+    suites = {test_ids[index].split("::", 1)[0] for index in readers}
+    return readers | {
+        index for index in file["module"] if test_ids[index].split("::", 1)[0] in suites
+    }
+
+
 def patch_compiles(path: str, edits: list[Edit], sources: ZipFile) -> bool:
     original = sources.read(path).decode("utf-8").splitlines()
     patched = []
@@ -148,13 +160,22 @@ def select_indices(
         file = evidence["files"].get(path)
         if file is None:
             return None
-        if strategy == "hybrid":
+        if strategy in ("hybrid", "scope-suites", "dialect-guard"):
             if path not in dialect_consumers:
                 if not file["module"]:
                     return None
-                selected.update(file["module"])
+                narrowed = (
+                    tests_in_affected_suites(file, edits, evidence["test_ids"])
+                    if strategy == "scope-suites"
+                    else set()
+                )
+                selected.update(narrowed or file["module"])
                 continue
             selected.update(dialect_consumers[path])
+            if strategy == "dialect-guard":
+                # These consumers include import-time and cross-module use
+                # that a function's observed execution alone can miss.
+                selected.update(file["module"])
         for edit in edits:
             scope = scope_for(file, edit)
             if not scope:
@@ -172,6 +193,56 @@ def select_indices(
             else:
                 selected.update(scope)
     return selected or None
+
+
+def select_precise(changes: dict, evidence: dict, sources: ZipFile) -> set[int] | None:
+    from precision import body_edit_kind, literal_field_classes, parse_edit
+
+    selected = set()
+    files = evidence["files"]
+    dialects = evidence["dialect_consumers"]
+    class_consumers = evidence.get("class_consumers", {})
+    observed_classes = evidence.get("observed_class_users", {})
+    test_ids = evidence["test_ids"]
+    for path, edits in changes.items():
+        record = files.get(path)
+        narrowed = set()
+        if record is not None:
+            try:
+                old, new = parse_edit(path, edits, sources)
+            except (BadZipFile, KeyError, SyntaxError, UnicodeError, ValueError, RecursionError):
+                return None
+            if ast.dump(old) == ast.dump(new):
+                continue
+            fields = literal_field_classes(old, new)
+            body = body_edit_kind(old, new, edits)
+            module = path.removesuffix(".py").replace("/", ".")
+            class_users = [observed_classes.get(f"{module}:{name}") for name in fields]
+            if fields and all(class_users):
+                narrowed = set().union(*class_users)
+                if path in dialects:
+                    narrowed.update(set(dialects[path]).union(*record["lines"].values()))
+                else:
+                    narrowed.update(set().union(*(class_consumers.get(name, ()) for name in fields)))
+            elif path not in dialects and body == "method":
+                scopes = [scope_for(record, edit) for edit in edits]
+                if all(scopes):
+                    narrowed = set().union(*scopes)
+            elif path not in dialects and body == "function":
+                narrowed = set().union(*record["lines"].values())
+                suites = {test_ids[index].split("::", 1)[0] for index in narrowed}
+                narrowed.update(
+                    index for index in record["module"]
+                    if test_ids[index].split("::", 1)[0] in suites
+                )
+
+        if not narrowed:
+            broad = select_indices({path: edits}, evidence, "hybrid", sources)
+            if broad is None:
+                return None
+            narrowed = broad
+        selected.update(narrowed)
+    return selected
 
 
 def split_lpt(tests: list[tuple[int, int]], worker_count: int) -> tuple[int, list[list[int]]]:
@@ -215,7 +286,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path("/data"))
     parser.add_argument("--evidence", type=Path, default=Path(__file__).with_name("coverage.json.gz"))
-    parser.add_argument("--strategy", choices=["hybrid", "scope", "line", "all"], default="hybrid")
+    parser.add_argument(
+        "--strategy",
+        choices=["hybrid", "scope-suites", "dialect-guard", "precision", "scope", "line", "all"],
+        default="hybrid",
+    )
     parser.add_argument("--sources", type=Path, default=Path(__file__).with_name("sources.zip"))
     parser.add_argument("--workers", type=int, choices=range(1, MAX_WORKERS + 1))
     args = parser.parse_args()
@@ -253,7 +328,12 @@ def main() -> None:
         if evidence is not None:
             try:
                 changes = parse_patch(patch.read_text(encoding="utf-8"))
-                indices = select_indices(changes, evidence, args.strategy, sources) if changes else None
+                if not changes:
+                    indices = None
+                elif args.strategy == "precision":
+                    indices = select_precise(changes, evidence, sources)
+                else:
+                    indices = select_indices(changes, evidence, args.strategy, sources)
             except (UnicodeError, ValueError):
                 indices = None
             if indices is not None:

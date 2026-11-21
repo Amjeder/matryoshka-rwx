@@ -26,3 +26,17 @@ SKIP_INTEGRATION=0 python build_coverage.py /path/to/pinned/sqlglot \
 ```
 
 The runtime image contains only the selector and source artifacts. Its root Dockerfile uses the organizer's pinned Python image and requires no network during execution.
+
+Use `--strategy scope-suites` to benchmark the experimental selector. For edits inside functions, it selects from test modules with observed coverage of those function bodies. Module-level changes and missing scope evidence retain the broader selection. The public scorer measured 367.140 simulated seconds with zero misses under the standard container limits. The default `hybrid` policy is the existing submission candidate.
+
+## Precision strategy
+
+The `precision` strategy compares the patched Python AST to the pinned source with type comments enabled. It checks that method edits stay inside existing bodies. Class metadata changes must preserve the literal's shape. It uses per-function coverage, observed test-module use, class references, subclasses, and class usage observed in the pinned tests and their spawned workers. When those checks lack positive evidence it uses the broader hybrid policy. A changed fixture uses its recorded readers.
+
+Add the class-reference index to a coverage map with the command below. All input data for the index comes from the pinned source and baseline coverage. Public sample answers are used by the scorer after selection.
+
+```sh
+python class_usage_capture.py /path/to/pinned/sqlglot /tmp/class-usage.json.gz
+python precision.py coverage.json.gz sources.zip coverage-with-classes.json.gz \
+    --class-usage /tmp/class-usage.json.gz
+```
